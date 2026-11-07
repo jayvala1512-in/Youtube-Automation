@@ -1,3 +1,131 @@
+name: Create Hindi Videos Free
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Generate Hindi Video Scripts"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hindi-videos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  render-videos:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Checkout current scripts
+        uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install free offline Hindi voice and video tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends espeak-ng ffmpeg fonts-noto-core
+          python -m pip install 'Pillow==11.3.0'
+
+      - name: Render Short and Long MP4 videos
+        run: |
+          python - <<'PY_RENDER'
+          import json
+          import math
+          import re
+          import shutil
+          import subprocess
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          from PIL import Image, ImageDraw, ImageFont
+
+          ROOT = Path.cwd()
+          FONT_DIR = Path('/usr/share/fonts/truetype/noto')
+          FONT_MAIN = FONT_DIR / 'NotoSansDevanagari-Regular.ttf'
+          FONT_BOLD = FONT_DIR / 'NotoSansDevanagari-Bold.ttf'
+          if not FONT_MAIN.exists():
+              raise SystemExit('Hindi font missing. Install fonts-noto-core before rendering.')
+
+
+          def run(cmd):
+              subprocess.run([str(x) for x in cmd], check=True)
+
+
+          def cleanup_script(text):
+              lines = text.splitlines()
+              spoken = []
+              title = ''
+              in_metadata = False
+              for line in lines:
+                  value = line.strip().replace('**', '').replace('__', '').replace('`', '')
+                  stripped = value.lstrip(' #*-\t').strip()
+                  if not stripped:
+                      if spoken and not in_metadata:
+                          spoken.append('')
+                      continue
+                  # The script-generation step adds separate scene / SEO / description sections.
+                  if re.search(r'^(?:दृश्य सुझाव|विजुअल सुझाव|सीन सुझाव|वीडियो विवरण|विवरण|हैशटैग|hashtags|description|visual suggestions|tags\b)', stripped, re.I):
+                      in_metadata = True
+                      continue
+                  if in_metadata:
+                      continue
+                  if re.match(r'^(?:शीर्षक|टाइटल|video title|title)\s*[:：-]', stripped, re.I):
+                      if not title:
+                          title = re.sub(r'^[^:：-]+[:：-]\s*', '', stripped)[:100]
+                      continue
+                  if re.match(r'^(?:स्क्रिप्ट|नैरेशन|हुक|प्रस्तावना|भाग\s*\d+|अंत|समापन|मुख्य भाग|intro|outro)\s*[:：-]?\s*$', stripped, re.I):
+                      continue
+                  if stripped.startswith('#'):
+                      continue
+                  # A bold, Markdown-style heading on the first line is the title.
+                  if not title and not spoken and (line.lstrip().startswith('#') or len(stripped.split()) <= 11):
+                      title = stripped[:100]
+                      continue
+                  if re.match(r'^(?:दृश्य|सीन)\s*\d+\s*[:：.-]', stripped):
+                      continue
+                  stripped = re.sub(r'^\s*[-•]\s*', '', stripped)
+                  spoken.append(stripped)
+              narration = '\n'.join(spoken).strip()
+              if len(narration) < 80:
+                  raise SystemExit('Script is too short or only contains metadata. Check generated/*.txt')
+              if not title:
+                  title = 'आज का रोचक विषय'
+              return title, narration
+
+
+          def wrap_text(text, font, max_width, max_lines=5):
+              words = text.split()
+              result, line = [], ''
+              for word in words:
+                  trial = f'{line} {word}'.strip()
+                  if font.getlength(trial) <= max_width:
+                      line = trial
+                  else:
+                      if line:
+                          result.append(line)
+                      line = word
+                  if len(result) >= max_lines:
+                      break
+              if len(result) < max_lines and line:
+                  result.append(line)
+              if len(result) > max_lines:
+                  result = result[:max_lines]
+              if result and len(words) > sum(len(s.split()) for s in result):
+                  result[-1] = result[-1].rstrip('। ') + '…'
+              return result
+
+
+          def make_card(path, kind, title, excerpt, card_number, cards_total):
               vertical = (kind == 'short')
               w, h = (720, 1280) if vertical else (1280, 720)
               img = Image.new('RGB', (w, h))
