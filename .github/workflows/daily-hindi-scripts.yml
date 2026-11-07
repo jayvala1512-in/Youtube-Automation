@@ -1,0 +1,97 @@
+name: Generate Hindi Video Scripts
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 06:30 AM India time (01:00 UTC); GitHub schedules can be delayed.
+    - cron: '0 1 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hindi-scripts-main
+  cancel-in-progress: false
+
+jobs:
+  create-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get website repository
+        uses: actions/checkout@v4
+
+      - name: Generate one Short and one Long Hindi script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: gemini-3.1-flash-lite
+        run: |
+          python - <<'PY'
+          import datetime
+          import json
+          import os
+          import pathlib
+          import urllib.error
+          import urllib.request
+          from zoneinfo import ZoneInfo
+
+          key = os.getenv("GEMINI_API_KEY")
+          if not key:
+              raise SystemExit("Missing GEMINI_API_KEY in GitHub Actions repository secrets")
+          model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+          day = datetime.datetime.now(ZoneInfo("Asia/Kolkata")).date()
+          folder = pathlib.Path("generated") / day.isoformat()
+          folder.mkdir(parents=True, exist_ok=True)
+          topics = [
+              "अंतरिक्ष और ग्रह", "मानव दिमाग", "रोचक विज्ञान", "प्रकृति के रहस्य",
+              "नई तकनीक", "दुनिया के आविष्कार", "समुद्र के रहस्य", "रोजमर्रा की साइंस",
+              "सौरमंडल", "जानवरों की अनोखी बातें", "कंप्यूटर और इंटरनेट", "पृथ्वी के रहस्य",
+          ]
+
+          for number, kind in enumerate(("short", "long")):
+              output = folder / f"{kind}.txt"
+              if output.exists():
+                  print(f"Already generated: {output}; skipping")
+                  continue
+              topic = topics[(day.toordinal() * 2 + number) % len(topics)]
+              duration = "45-60 सेकंड, लगभग 110-140 शब्द" if kind == "short" else "6-8 मिनट, लगभग 750-950 शब्द"
+              prompt = (
+                  f"एक YouTube {kind.upper()} के लिए नया, असली और आकर्षक हिंदी स्क्रिप्ट लिखें। "
+                  f"विषय क्षेत्र: {topic}. अवधि: {duration}. "
+                  "जवाब केवल देवनागरी हिंदी में लिखें। शुरुआत में शीर्षक और 2 सेकंड का हुक दें, "
+                  "फिर पूरा नैरेशन, दृश्य सुझाव (5-8), वीडियो विवरण और 5 हैशटैग दें। "
+                  "तथ्य बढ़ा-चढ़ाकर न कहें; अनिश्चित या अप्रमाणित बातों को तथ्य की तरह न लिखें। "
+                  "कॉपीराइट-सुरक्षित और ओरिजिनल सामग्री बनाएं। "
+                  "किसी वास्तविक व्यक्ति की नकली आवाज/पहचान प्रस्तुत न करें।"
+              )
+              payload = {
+                  "contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {"temperature": 0.8, "maxOutputTokens": 4096},
+              }
+              request = urllib.request.Request(
+                  f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                  data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                  headers={"Content-Type": "application/json", "x-goog-api-key": key},
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=120) as response:
+                      result = json.load(response)
+              except urllib.error.HTTPError as error:
+                  raise SystemExit(f"Gemini request failed with HTTP {error.code}; check model and free-tier quota")
+              parts = result.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+              script = "\n".join(p.get("text", "") for p in parts if p.get("text"))
+              if not script.strip():
+                  raise SystemExit(f"Gemini returned no script for {kind}; no empty file saved")
+              output.write_text(script.strip() + "\n", encoding="utf-8")
+              print(f"Created: {output} ({len(script)} chars)")
+          PY
+
+      - name: Save scripts to repository
+        run: |
+          git add generated/
+          if ! git diff --cached --quiet; then
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Add daily Hindi video scripts'
+            git push
+          else
+            echo 'No new scripts to save'
+          fi
