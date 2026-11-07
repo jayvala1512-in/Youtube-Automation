@@ -1,96 +1,119 @@
-name: Create Hindi Videos Free
+              vertical = (kind == 'short')
+              w, h = (720, 1280) if vertical else (1280, 720)
+              img = Image.new('RGB', (w, h))
+              draw = ImageDraw.Draw(img)
+              # Self-created artwork: gradient, curved abstract panels, simple typography.
+              for y in range(h):
+                  alpha = y / max(1, h - 1)
+                  r = int(14 + 13 * alpha)
+                  g = int(24 + 14 * alpha)
+                  b = int(48 + 28 * alpha)
+                  draw.line((0, y, w, y), fill=(r, g, b))
+              accent = (72, 211, 195) if kind == 'short' else (255, 188, 95)
+              for j in range(4):
+                  radius = int(w * (0.35 + j * 0.1))
+                  x, y = int(w * (0.76 - j * 0.08)), int(h * (0.27 + j * 0.04))
+                  draw.ellipse((x-radius, y-radius, x+radius, y+radius), outline=(*accent[:3],), width=2)
+              pad = int(w * 0.08)
+              header_font = ImageFont.truetype(str(FONT_BOLD), 28 if vertical else 27)
+              title_font = ImageFont.truetype(str(FONT_BOLD), 54 if vertical else 58)
+              body_font = ImageFont.truetype(str(FONT_MAIN), 37 if vertical else 37)
+              chip_font = ImageFont.truetype(str(FONT_BOLD), 23)
+              draw.text((pad, int(h*0.055)), 'YOUTUBE AI STUDIO', font=header_font, fill=accent)
+              tag = 'HINDI SHORTS' if vertical else 'HINDI LONG VIDEO'
+              draw.rounded_rectangle((pad, int(h*0.13), pad + 270, int(h*0.13)+50), radius=18, fill=(35, 58, 83))
+              draw.text((pad+17, int(h*0.13)+9), tag, font=chip_font, fill=(231, 240, 246))
+              title_y = int(h*(0.26 if vertical else 0.28))
+              title_lines = wrap_text(title, title_font, w-2*pad, max_lines=3)
+              for j, line in enumerate(title_lines):
+                  draw.text((pad, title_y + j*int(title_font.size*1.5)), line, font=title_font, fill=(255,255,255))
+              excerpt_y = max(title_y + len(title_lines)*int(title_font.size*1.5) + 48, int(h*0.51))
+              summary_lines = wrap_text(excerpt, body_font, w-2*pad-20, max_lines=5 if vertical else 3)
+              for j, line in enumerate(summary_lines):
+                  draw.text((pad, excerpt_y + j*int(body_font.size*1.65)), line, font=body_font, fill=(220, 236, 241))
+              by = int(h*0.91)
+              draw.rounded_rectangle((pad, by, w-pad, by+10), radius=5, fill=(50, 66, 87))
+              draw.rounded_rectangle((pad, by, pad+int((w-2*pad)*(card_number+1)/cards_total), by+10), radius=5, fill=accent)
+              draw.text((pad, by+20), f'{card_number+1:02d} / {cards_total:02d}', font=chip_font, fill=(203, 220, 232))
+              img.save(path)
 
-on:
-  workflow_dispatch:
-  workflow_run:
-    workflows: ["Generate Hindi Video Scripts"]
-    types: [completed]
 
-permissions:
-  contents: read
+          def command_output(args):
+              return subprocess.check_output([str(x) for x in args], text=True).strip()
 
-concurrency:
-  group: hindi-videos-${{ github.ref }}
-  cancel-in-progress: false
 
-jobs:
-  render-videos:
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 50
-    steps:
-      - name: Checkout current scripts
-        uses: actions/checkout@v5
+          def render(kind, source, outdir):
+              title, narration = cleanup_script(source.read_text(encoding='utf-8'))
+              tmp = outdir / f'_{kind}'
+              tmp.mkdir(parents=True, exist_ok=True)
+              narration_path = tmp / 'narration.txt'
+              narration_path.write_text(narration, encoding='utf-8')
+              voice_tool = shutil.which('espeak-ng') or shutil.which('espeak')
+              if not voice_tool:
+                  raise SystemExit('Offline speech engine not found: install espeak-ng')
+              wav = tmp / 'narration.wav'
+              run([voice_tool, '-v', 'hi', '-s', '135', '-f', narration_path, '-w', wav])
+              seconds = float(command_output(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', wav]))
+              if seconds < 3:
+                  raise SystemExit(f'Audio duration too small for {kind}: {seconds}')
+              tokens = narration.split()
+              count = 7 if kind == 'long' else 5
+              # Distinct card content from representative portions of the script.
+              card_files = []
+              for n in range(count):
+                  start = int(len(tokens) * n / count)
+                  fragment = ' '.join(tokens[start:start+32])
+                  filename = tmp / f'frame_{n:02d}.png'
+                  make_card(filename, kind, title, fragment, n, count)
+                  card_files.append(filename)
+              ffconcat = tmp / 'slides.ffconcat'
+              seconds_per_card = seconds / count
+              lines = ['ffconcat version 1.0']
+              for file in card_files:
+                  lines.extend([f"file '{file.resolve()}'", f'duration {seconds_per_card:.6f}'])
+              # Last frame repeated so concat demuxer respects final duration.
+              lines.append(f"file '{card_files[-1].resolve()}'")
+              ffconcat.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+              output = outdir / f'{kind}.mp4'
+              run([
+                  'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+                  '-safe', '0', '-f', 'concat', '-i', ffconcat, '-i', wav,
+                  '-vf', 'fps=12,format=yuv420p',
+                  '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '27',
+                  '-c:a', 'aac', '-b:a', '112k', '-movflags', '+faststart',
+                  '-shortest', output,
+              ])
+              if output.stat().st_size < 15_000:
+                  raise SystemExit(f'Render produced an unexpectedly tiny file: {output}')
+              actual_seconds = float(command_output(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', output]))
+              if abs(actual_seconds - seconds) > max(2.0, seconds * .05):
+                  raise SystemExit(f'Video/audio duration mismatch for {kind}: {actual_seconds:.1f}s vs {seconds:.1f}s')
+              print(f'Rendered {output} ({actual_seconds:.1f} sec; {output.stat().st_size / 1e6:.1f} MB)')
+              return dict(kind=kind, title=title, duration_seconds=round(actual_seconds, 2), file=output.name)
+
+
+          def main():
+              folders = sorted((ROOT / 'generated').glob('????-??-??'), reverse=True)
+              match = next((p for p in folders if (p / 'short.txt').is_file() and (p / 'long.txt').is_file()), None)
+              if not match:
+                  raise SystemExit('No pair of generated/YYYY-MM-DD/{short,long}.txt found. Run script generator first.')
+              outdir = ROOT / 'videos' / match.name
+              outdir.mkdir(parents=True, exist_ok=True)
+              results = [render(k, match / f'{k}.txt', outdir) for k in ('short', 'long')]
+              (outdir / 'video_manifest.json').write_text(json.dumps({'date': match.name, 'videos': results}, ensure_ascii=False, indent=2), encoding='utf-8')
+              print(f'Both videos finished. Source folder: {match}')
+
+
+          if __name__ == '__main__':
+              main()
+
+          PY_RENDER
+
+      - name: Save MP4 videos as downloadable workflow artifact
+        uses: actions/upload-artifact@v4
         with:
-          ref: main
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
-
-      - name: Install free offline Hindi voice and video tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends espeak-ng ffmpeg fonts-noto-core
-          python -m pip install 'Pillow==11.3.0'
-
-      - name: Render Short and Long MP4 videos
-        run: |
-          python - <<'PY_RENDER'
-          import json
-          import math
-          import re
-          import shutil
-          import subprocess
-          from datetime import datetime
-          from pathlib import Path
-          from zoneinfo import ZoneInfo
-
-          from PIL import Image, ImageDraw, ImageFont
-
-          ROOT = Path.cwd()
-          FONT_DIR = Path('/usr/share/fonts/truetype/noto')
-          FONT_MAIN = FONT_DIR / 'NotoSansDevanagari-Regular.ttf'
-          FONT_BOLD = FONT_DIR / 'NotoSansDevanagari-Bold.ttf'
-          if not FONT_MAIN.exists():
-              raise SystemExit('Hindi font missing. Install fonts-noto-core before rendering.')
-
-
-          def run(cmd):
-              subprocess.run([str(x) for x in cmd], check=True)
-
-
-          def cleanup_script(text):
-              lines = text.splitlines()
-              spoken = []
-              title = ''
-              in_metadata = False
-              for line in lines:
-                  value = line.strip().replace('**', '').replace('__', '').replace('`', '')
-                  stripped = value.lstrip(' #*-\t').strip()
-                  if not stripped:
-                      if spoken and not in_metadata:
-                          spoken.append('')
-                      continue
-                  # The script-generation step adds separate scene / SEO / description sections.
-                  if re.search(r'^(?:दृश्य सुझाव|विजुअल सुझाव|सीन सुझाव|वीडियो विवरण|विवरण|हैशटैग|hashtags|description|visual suggestions|tags\b)', stripped, re.I):
-                      in_metadata = True
-                      continue
-                  if in_metadata:
-                      continue
-                  if re.match(r'^(?:शीर्षक|टाइटल|video title|title)\s*[:：-]', stripped, re.I):
-                      if not title:
-                          title = re.sub(r'^[^:：-]+[:：-]\s*', '', stripped)[:100]
-                      continue
-                  if re.match(r'^(?:स्क्रिप्ट|नैरेशन|हुक|प्रस्तावना|भाग\s*\d+|अंत|समापन|मुख्य भाग|intro|outro)\s*[:：-]?\s*$', stripped, re.I):
-                      continue
-                  if stripped.startswith('#'):
-                      continue
-                  # A bold, Markdown-style heading on the first line is the title.
-                  if not title and not spoken and (line.lstrip().startswith('#') or len(stripped.split()) <= 11):
-                      title = stripped[:100]
-                      continue
-                  if re.match(r'^(?:दृश्य|सीन)\s*\d+\s*[:：.-]', stripped):
-                      continue
-                  stripped = re.sub(r'^\s*[-•]\s*', '', stripped)
+          name: hindi-videos-${{ github.run_number }}
+          path: videos/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
